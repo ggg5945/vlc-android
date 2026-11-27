@@ -88,6 +88,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.videolan.libvlc.FactoryManager
 import org.videolan.libvlc.MediaPlayer
@@ -838,17 +839,29 @@ class PlaybackService : MediaBrowserServiceCompat(), LifecycleOwner, CoroutineSc
 
     @OptIn(ObsoleteCoroutinesApi::class)
     private fun setupScope() {
+        // Called from onCreate() and again from onStartCommand(). Recreating the actor drops the
+        // previous channel while callbacks stay registered on this instance, so nothing consumes
+        // the queued messages anymore. Keep a single actor for the service lifetime.
+        if (::cbActor.isInitialized) return
         cbActor = lifecycleScope.actor(capacity = Channel.UNLIMITED) {
-            for (update in channel) when (update) {
-                CbUpdate -> for (callback in callbacks) callback.update()
-                is CbMediaEvent -> for (callback in callbacks) callback.onMediaEvent(update.event)
-                is CbMediaPlayerEvent -> for (callback in callbacks) callback.onMediaPlayerEvent(update.event)
-                is CbRemove -> callbacks.remove(update.cb)
-                is CbAdd -> callbacks.add(update.cb)
-                ShowNotification -> showNotificationInternal()
-                is HideNotification -> hideNotificationInternal(update.remove)
-                UpdateMeta -> updateMetadataInternal()
-                UpdateState -> executeUpdate(true)
+            for (update in channel) {
+                // One failing callback must not terminate the actor: that would silently stop
+                // delivering player events to the UI (stuck loading spinner, frozen overlay).
+                try {
+                    when (update) {
+                        CbUpdate -> for (callback in callbacks) callback.update()
+                        is CbMediaEvent -> for (callback in callbacks) callback.onMediaEvent(update.event)
+                        is CbMediaPlayerEvent -> for (callback in callbacks) callback.onMediaPlayerEvent(update.event)
+                        is CbRemove -> callbacks.remove(update.cb)
+                        is CbAdd -> callbacks.add(update.cb)
+                        ShowNotification -> showNotificationInternal()
+                        is HideNotification -> hideNotificationInternal(update.remove)
+                        UpdateMeta -> updateMetadataInternal()
+                        UpdateState -> executeUpdate(true)
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Callback dispatch failed for ${update.javaClass.simpleName}", t)
+                }
             }
         }
     }
@@ -1231,7 +1244,13 @@ class PlaybackService : MediaBrowserServiceCompat(), LifecycleOwner, CoroutineSc
                     }
                     else -> {
                         //The media id may be 0 on resume
-                        val mw = getFromMl { findMedia(media) }
+                        //getFromMl() suspends until the medialibrary is ready. On a remote (SMB/HTTP)
+                        //media the medialibrary startup can be delayed, and this runs inside the
+                        //callback actor which consumes player events serially: blocking here stops
+                        //every later event, so Buffering==100 never reaches the player overlay and
+                        //the loading spinner never stops. Bound the wait and fall back to the
+                        //MediaWrapper we already have.
+                        val mw = withTimeoutOrNull(ML_LOOKUP_TIMEOUT) { getFromMl { findMedia(media) } } ?: media
                         val mediaId = MediaSessionBrowser.generateMediaId(mw)
                         artworkMap[mediaId] ?: ArtworkProvider.buildMediaUri(ctx, mw)
                     }
@@ -2029,6 +2048,9 @@ class PlaybackService : MediaBrowserServiceCompat(), LifecycleOwner, CoroutineSc
         private const val SHOW_TOAST = "show_toast"
         private const val END_MEDIASESSION = "end_mediasession"
         private const val UPDATE_META = "update_meta"
+
+        /** Upper bound for a medialibrary lookup done while building the media metadata. */
+        private const val ML_LOOKUP_TIMEOUT = 2000L
 
         val playerSleepTime by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Calendar?>().apply { value = null } }
 
