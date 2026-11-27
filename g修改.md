@@ -321,7 +321,115 @@ application/app/build/outputs/apk/debug/VLC-Android-3.7.1-debug-all.apk
 
 ---
 
-## 六、提交信息
+## 六、设备画面截取方法（screencap 与 scrcpy 的差异）
+
+本次排查全程使用 `screencap` 取画面证据，未使用 scrcpy。记录该方法的完整用法，并说明为什么 scrcpy 在这台电视上很可能看不到视频画面。
+
+### 6.1 实际使用的命令
+
+```bash
+ADB="D:/software/Android/Sdk/platform-tools/adb.exe"
+
+# 截图写到设备临时目录（这台电视 /sdcard 只读，不能直接写）
+adb -s 192.168.1.110:5555 shell "screencap -p /data/local/tmp/x.png"
+
+# 拉回电脑（Git Bash 会改写路径，必须关掉转换）
+MSYS_NO_PATHCONV=1 adb -s 192.168.1.110:5555 pull /data/local/tmp/x.png _dbg/x.png
+```
+
+三个必须注意的点：
+
+- **`/sdcard` 只读**：`screencap -p /sdcard/x.png` 报 `Read-only file system`。这台电视的 `/sdcard` 挂的是只读镜像，只能写 `/data/local/tmp/`。
+- **MSYS 路径改写**：Git Bash 会把 `adb pull /data/local/tmp/x.png` 中的绝对路径转换成 `C:/Program Files/Git/data/local/...`，导致 `remote object does not exist`。加 `MSYS_NO_PATHCONV=1` 前缀即可。
+- **参数被误解析**：`screencap -p <file>` 在某些上下文中 `-p` 会被宿主 shell 当作参数。整条命令用引号包住交给 `adb shell` 执行最稳妥。
+
+### 6.2 用文件大小快速判断画面内容
+
+批量截图时无需逐张打开，按 PNG 体积可粗略区分：
+
+| 文件大小 | 通常内容 |
+|---|---|
+| 10 KB ~ 250 KB | 纯黑 / 纯色 / 单一 Logo 停留（加载中、片头静帧） |
+| 800 KB ~ 1.8 MB | 真实视频帧（有画面细节与噪点） |
+
+本次排查正是靠这个特征快速筛选出「画面到底出来没有」，再对可疑帧做人工确认。
+
+### 6.3 为什么 scrcpy 看不到播放画面
+
+`screencap` 与 `scrcpy` 走两条完全不同的路径：
+
+| 工具 | 路径 |
+|---|---|
+| `screencap` | SurfaceFlinger 执行一次 GL 合成，把全部可见图层（含视频层）读回为 PNG |
+| `scrcpy` | 创建 `VirtualDisplay` → `MediaCodec` 硬编码 → 网络推流到电脑 |
+
+差异集中在视频层的合成方式，可能原因按可能性排序：
+
+1. **硬件 overlay 直出（最常见）**
+   MediaCodec 解码输出的帧被写入 SoC 的视频硬件层（HWC overlay），由显示控制器直接扫描输出，**不经过 GPU 合成**。`VirtualDisplay` 的编码器读不到这块像素，表现为视频区域全黑或冻结在首帧，而 UI 叠加层（进度条、按钮）正常显示。
+   `screencap` 会强制触发一次 GPU 合成，因此能把 overlay 内容取回 —— 这是同一时刻 `screencap` 有画面、scrcpy 黑屏的典型成因。
+
+2. **受保护图层**
+   视频 `SurfaceView` 调用了 `setSecure()`，或走 DRM 链路。任何编码捕获路径必然黑屏。
+   本次测试的是 SMB 本地 mp4，理论上不涉及 DRM，可排除此项。
+
+3. **Android 5.1 上的 scrcpy 兼容性**
+   目标设备为 API 22 + arm64。scrcpy 名义上支持 5.0+，但老固件的 `MediaProjection` / `VirtualDisplay` 实现常有缺陷，典型表现是能连上、能看到 UI、视频区黑。查看 scrcpy 自身日志可辅助判断：
+
+```bash
+scrcpy --log-level=debug 2>&1 | findstr /i "encoder display codec error"
+```
+
+4. **连接到了另一台设备**
+   本机 `adb devices` 中存在多个目标（如 `192.168.1.110:5555` 与 `192.168.6.13:5555`）。若 scrcpy 未显式指定 serial，可能连到了错误的设备：
+
+```bash
+scrcpy -s 192.168.1.110:5555
+```
+
+### 6.4 定位属于哪一类
+
+在同一时刻用两种方式抓取，直接对比：
+
+```bash
+# A. scrcpy 运行期间，用 screencap 抓一张
+adb -s 192.168.1.110:5555 shell "screencap -p /data/local/tmp/cmp.png"
+MSYS_NO_PATHCONV=1 adb -s 192.168.1.110:5555 pull /data/local/tmp/cmp.png cmp.png
+```
+
+| 现象 | 结论 |
+|---|---|
+| screencap 有画面、scrcpy 黑 | 硬件 overlay 或 VirtualDisplay 读回问题（第 1、3 类） |
+| 两者都黑 | 受保护图层（第 2 类） |
+| 两者都有画面 | 并非捕获问题，而是 scrcpy 连错设备或窗口（第 4 类） |
+
+查看图层合成方式（Android 5.1）：
+
+```bash
+adb -s 192.168.1.110:5555 shell "dumpsys SurfaceFlinger" | findstr /i "HWC composition layer"
+```
+
+若视频层标记为 `HWC`（硬件合成），即属于第 1 类。
+
+### 6.5 可选方案
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| 1. VLC 关闭硬件解码 | 设置 → 视频 → 硬件加速改为禁用 | 验证可用；高码率/4K 会掉帧，仅适合调试 |
+| 2. 继续使用 screencap | 即 6.1 的命令 | 已验证有效；只能静态截图，无法实时观察 |
+| 3. 换用较旧 scrcpy | 试 scrcpy 1.25 / 2.0 等老版本 | 新版对老 API 的 `VirtualDisplay` 兼容性变差 |
+| 4. 设备端 screenrecord | 见下 | 同为 VirtualDisplay 路径，大概率同样黑视频区 |
+
+```bash
+adb -s 192.168.1.110:5555 shell "screenrecord --time-limit 30 /data/local/tmp/rec.mp4"
+MSYS_NO_PATHCONV=1 adb -s 192.168.1.110:5555 pull /data/local/tmp/rec.mp4 rec.mp4
+```
+
+`screenrecord` 若**能**录到视频画面，说明问题只在 scrcpy 版本（方案 3）；若同样黑，则确认是硬件 overlay（方案 1）。
+
+---
+
+## 七、提交信息
 
 ```
 Fix video loading spinner never stopping after remote media playback
@@ -351,7 +459,7 @@ Two related robustness fixes in the same dispatch path:
 
 ---
 
-## 七、备注
+## 八、备注
 
 1. **术语准确性**：`PlaybackService` 的 `coroutineContext` 是 `Dispatchers.IO + SupervisorJob()`，所以 actor 是「串行消费」而不是「单线程阻塞」。`getFromMl()` 是 suspend 函数，它**挂起协程**等待回调，不是阻塞线程。描述该类问题时用 suspended 比 blocked 更准确。
 
